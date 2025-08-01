@@ -1,0 +1,336 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © fluxchart
+//
+//@version=6
+indicator("Impulse Zones | Flux Charts",overlay = true, max_boxes_count = 500, max_labels_count = 500)
+
+showHistoricZones = input.bool(false, "Show Historic Zones", group = "General Configuration", display = display.none)
+
+const int maxIZCount = 15
+const int minIZSize = 4
+
+const int atrLen = 20
+const int extendZonesBy = 10
+const int deleteAfterUntouched = 200
+
+var int curTFs = timeframe.in_seconds()
+
+izEnabled = true
+
+var volCheck = false
+if (not volCheck) and volume > 0
+    volCheck := true
+atr = ta.atr(atrLen)
+
+insideBounds = bar_index > last_bar_index - 5000
+const bool renderingEnabled = true
+
+var timeByBarRequired = true
+var timeByBar = array.new<int>()
+if barstate.isconfirmed and timeByBarRequired
+    if timeByBar.size() == 0
+        while timeByBar.size() != bar_index
+            timeByBar.push(0)
+    timeByBar.push(time)
+
+getTimeByBar (barIndex) =>
+    if timeByBar.size() <= barIndex
+        time
+    else
+        timeByBar.get(barIndex)
+
+invalidateBottomClose = math.min(close, open)
+invalidateTopClose = math.max(close, open)
+getInvalidationPoint (bool isTop, bool isClose) =>
+    if isTop and isClose
+        invalidateTopClose
+    else if isTop and (not isClose)
+        high
+    else if (not isTop) and isClose
+        invalidateBottomClose
+    else
+        low
+
+//#region IZs
+izInvalidation = input.string("Close", "Invalidation Method", options = ["Wick", "Close"],  group = "Impulse Zones", display = display.none)
+izSensitivity = input.int(4, "Size Sensitivity", minval = 1, maxval = 20, group = "Impulse Zones", tooltip = "Higher values may identify fewer, larger zones. Lower values may detect more, smaller zones.", display = display.none)
+var float izSensCoefficient = 2.0 + izSensitivity / 2.0
+volumeSensitivity = input.int(2, "Volume Sensitivity", minval = 2, maxval = 8, group = "Impulse Zones", display = display.none)
+var float volumeSensCoefficient = 1.0 + izSensitivity / 4.0
+izMidline = true
+izLabel = input.bool(true, "Labels ", group = "Impulse Zones", inline="btm", display = display.none)
+retestsEnabled = input.bool(true, "Retests ", group = "Impulse Zones", inline="btm", display = display.none)
+breaksEnabled = input.bool(true, "Breaks", group = "Impulse Zones", inline="btm", display = display.none)
+
+izBullColor = input.color(#08998150, "Bullish", inline = "EV", group = "Style", display = display.none)
+izBearColor = input.color(#f2364650, "Bearish", inline = "EV", group = "Style", display = display.none)
+
+textColor = input.color(#ffffff80, "Text", inline = "text", group = "Style")
+breakColor = input.color(#0055EE, "Break", inline = "text", group = "Style")
+dbgLabelTextSize = input.string(size.normal, "Text Size", options = [size.tiny, size.small, size.normal, size.large, size.huge, size.auto], display = display.none)
+dbgLineWidth = 1
+
+bullishIZAlertEnabled = input.bool(true, "Bullish IZ", inline = "IZ", group = "Alerts")
+bearishIZAlertEnabled = input.bool(true, "Bearish IZ", inline = "IZ", group = "Alerts")
+bullishIZRetestAlertEnabled = input.bool(true, "Bullish IZ Retest", inline = "IZ2", group = "Alerts")
+bearishIZRetestAlertEnabled = input.bool(true, "Bearish IZ Retest", inline = "IZ2", group = "Alerts")
+
+type IZ
+    bool isBull
+    int startTime
+    int detectedTime
+    int detectedIndex
+    int endTime
+    int endIndex
+    float top
+    float bottom
+    int lastTouchedIndex
+
+    bool dormant
+    int izRetests = 0
+
+    box zone
+
+    line volSeperatorLine
+    array<label> retestLabels
+
+var allIZs = array.new<IZ>()
+var izsToRemove = array.new<IZ>()
+
+queueIZForRemoval (IZ iz) =>
+    iz.dormant := true
+    izsToRemove.push(iz)
+
+avgVolume = ta.ema(volume, atrLen)
+detectIZ () =>
+    bool _isBull = close > open
+    int _startTime = na
+
+    float _top = na
+    float _bottom = na
+
+    _top := high
+    _bottom := low
+    _startTime := time
+
+    bool sizeCondition = (_top - _bottom) > atr * izSensCoefficient
+    bool volumeCondition = volume > avgVolume * volumeSensitivity
+    if sizeCondition and volumeCondition
+        [_isBull, _startTime, _top, _bottom]
+    else
+        [false, na, na, na]
+
+// IZ Detection
+
+combineIZ (_isBull, _startTime, _top, _bottom) =>
+    _didCombine = false
+    for curIZ in allIZs
+        if (curIZ.isBull != _isBull) 
+            continue
+        yIntersect = ((_bottom <= curIZ.top and _bottom >= curIZ.bottom) or (_top >= curIZ.bottom and _top <= curIZ.top)) or ((curIZ.bottom <= _top and curIZ.bottom >= _bottom) or (curIZ.top >= _bottom and curIZ.top <= _top))
+        xIntersect = na(curIZ.endTime) or (_startTime <= curIZ.endTime)
+        overlappingPercentage = 0.0
+        if yIntersect
+            range_size = math.abs(_top - _bottom)
+            overlap_top = math.min(_top, curIZ.top)
+            overlap_bottom = math.max(_bottom, curIZ.bottom)
+            overlap_size = math.max(0, overlap_top - overlap_bottom)
+            overlappingPercentage := (overlap_size / range_size) * 100.0
+
+        if yIntersect and xIntersect and overlappingPercentage > 0
+            curIZ.top := math.max(curIZ.top, _top)
+            curIZ.bottom := math.min(curIZ.bottom, _bottom)
+            curIZ.startTime := math.min(curIZ.startTime, _startTime)
+            curIZ.detectedTime := math.max(curIZ.detectedTime, time)
+            curIZ.detectedIndex := math.max(curIZ.detectedIndex, bar_index)
+            curIZ.dormant := false
+            curIZ.endIndex := na
+            curIZ.endTime := na
+            curIZ.lastTouchedIndex := bar_index
+            _didCombine := true
+            break
+    _didCombine
+
+var curIZCount = 0
+bool bullishIZDetected = false
+bool bearishIZDetected = false
+
+if izEnabled and barstate.isconfirmed and insideBounds
+    [_isBull, _startTime, _top, _bottom] = detectIZ()
+    
+    if (not na(_startTime)) and (not combineIZ(_isBull, _startTime, _top, _bottom))
+        detectedIZ = IZ.new(_isBull, _startTime, time, bar_index, na, na, _top, _bottom, bar_index)
+        allIZs.push(detectedIZ)
+        bullishIZDetected := _isBull
+        bearishIZDetected := not _isBull
+        if curIZCount + 1 > maxIZCount
+            for curIZ in allIZs
+                queueIZForRemoval(curIZ)
+                break
+
+barcolor(bullishIZDetected ? color.new(izBullColor, 0) : bearishIZDetected ? color.new(izBearColor, 0) : na)
+
+destroyIZ (IZ iz) =>
+    if renderingEnabled
+        box.delete(iz.zone)
+        iz.zone := na
+        line.delete(iz.volSeperatorLine)
+        iz.volSeperatorLine := na
+        if not na(iz.retestLabels)
+            for curLabel in iz.retestLabels
+                label.delete(curLabel)
+            iz.retestLabels.clear()
+            iz.retestLabels := na
+
+updateIZ (IZ iz) =>
+    renderBullishRetest = false
+    renderBullishBreak = false
+    renderBearishRetest = false
+    renderBearishBreak = false
+
+    invalidateBottom = getInvalidationPoint(false, izInvalidation != "Wick")
+    invalidateTop = getInvalidationPoint(true, izInvalidation != "Wick")
+    // IZ Invalidation
+    if iz.isBull and invalidateBottom < iz.bottom
+        iz.endTime := time
+        iz.endIndex := bar_index
+        iz.dormant := true
+        renderBullishBreak := true
+        if (not showHistoricZones)
+            queueIZForRemoval(iz)
+    else if (not iz.isBull) and invalidateTop > iz.top
+        iz.endTime := time
+        iz.endIndex := bar_index
+        iz.dormant := true
+        renderBearishBreak := true
+        if (not showHistoricZones)
+            queueIZForRemoval(iz)
+    
+    // IZ Last Touched & Retracement
+    if (iz.isBull and low < iz.top)
+        if close > iz.top
+            iz.izRetests += 1
+            renderBullishRetest := true
+        iz.lastTouchedIndex := bar_index
+    else if ((not iz.isBull) and high > iz.bottom)
+        if close < iz.bottom
+            iz.izRetests += 1
+            renderBearishRetest := true
+        iz.lastTouchedIndex := bar_index
+    
+    if bar_index - iz.lastTouchedIndex > deleteAfterUntouched
+        queueIZForRemoval(iz)
+    
+    [renderBullishRetest, renderBearishRetest, renderBullishBreak, renderBearishBreak]
+
+// IZ Update
+renderBullishRetest = false
+renderBullishBreak = false
+renderBearishRetest = false
+renderBearishBreak = false
+
+IZ bullishRetestIZ = na
+IZ bearishRetestIZ = na
+IZ bullishBreakIZ = na
+IZ bearishBreakIZ = na
+if izEnabled and barstate.isconfirmed and insideBounds and allIZs.size() > 0
+    for curIZ in allIZs
+        if (not curIZ.dormant)
+            [_1, _2, _3, _4] = updateIZ(curIZ)
+            if not renderBullishRetest
+                renderBullishRetest := _1 ? true : renderBullishRetest
+                bullishRetestIZ := _1 ? curIZ : bullishRetestIZ
+            if not renderBearishRetest
+                renderBearishRetest := _2 ? true : renderBearishRetest
+                bearishRetestIZ := _2 ? curIZ : bearishRetestIZ
+            if not renderBullishBreak
+                renderBullishBreak := _3 ? true : renderBullishBreak
+                bullishBreakIZ := _3 ? curIZ : bullishBreakIZ
+            if not renderBearishBreak
+                renderBearishBreak := _4 ? true : renderBearishBreak
+                bearishBreakIZ := _4 ? curIZ : bearishBreakIZ
+
+const int retestSize = 4
+if (retestsEnabled and renderBullishRetest)
+    newLabel = label.new(bar_index, close, "", yloc = yloc.belowbar, style = label.style_triangleup, color = color.new(izBullColor, 0), size = retestSize)
+    if na(bullishRetestIZ.retestLabels)
+        bullishRetestIZ.retestLabels := array.new<label>()
+    bullishRetestIZ.retestLabels.push(newLabel)
+if (retestsEnabled and renderBearishRetest)
+    newLabel = label.new(bar_index, close, "", yloc = yloc.abovebar, style = label.style_triangledown, color = color.new(izBearColor, 0), size = retestSize)
+    if na(bearishRetestIZ.retestLabels)
+        bearishRetestIZ.retestLabels := array.new<label>()
+    bearishRetestIZ.retestLabels.push(newLabel)
+if (breaksEnabled and renderBullishBreak)
+    newLabel = label.new(bar_index, close, "B", yloc = yloc.abovebar, style = label.style_label_down, textcolor = color.new(textColor, 0), color = breakColor)
+    if na(bullishBreakIZ.retestLabels)
+        bullishBreakIZ.retestLabels := array.new<label>()
+    bullishBreakIZ.retestLabels.push(newLabel)
+if (breaksEnabled and renderBearishBreak)
+    newLabel = label.new(bar_index, close, "B", yloc = yloc.belowbar, style = label.style_label_up, textcolor = color.new(textColor, 0), color = breakColor)
+    if na(bearishBreakIZ.retestLabels)
+        bearishBreakIZ.retestLabels := array.new<label>()
+    bearishBreakIZ.retestLabels.push(newLabel)
+
+if izsToRemove.size() > 0
+    for izToRemove in izsToRemove
+        destroyIZ(izToRemove)
+        _foundIZIndex = allIZs.indexof(izToRemove)
+        if _foundIZIndex != -1
+            allIZs.remove(_foundIZIndex)
+        curIZCount -= 1
+    izsToRemove.clear()
+
+renderIZ (IZ iz) =>
+    bool _shouldRender = true
+
+    int _endTime = nz(iz.endTime, time(timeframe.period, -extendZonesBy))
+
+    int _endIndex = nz(iz.endIndex, bar_index + extendZonesBy)
+    
+    if (_endTime - iz.startTime < curTFs * minIZSize * 1000)
+        _shouldRender := false
+        queueIZForRemoval(iz)
+    
+    if _shouldRender
+        float _midLine = (iz.top + iz.bottom) / 2.0
+        color curIZColor = iz.isBull ? izBullColor : izBearColor
+
+        // Text
+        izText = izLabel ? "IZ" : ""
+
+        if na(iz.zone) // Create Zone
+            // Base Zone
+            iz.zone := box.new(iz.startTime, iz.top, _endTime, iz.bottom, bgcolor = curIZColor, xloc = xloc.bar_time, border_width = 0, text_color = textColor, text_size = dbgLabelTextSize, text_halign = text.align_center)
+            iz.zone.set_text(izText)
+            if izMidline
+                iz.volSeperatorLine := line.new(iz.startTime, _midLine, _endTime, _midLine, xloc = xloc.bar_time, style = line.style_dashed, color = textColor, width = dbgLineWidth)
+        else // Update Zone
+            iz.zone.set_right(_endTime)
+            if izMidline
+                iz.volSeperatorLine.set_xy1(iz.startTime, _midLine)
+                iz.volSeperatorLine.set_xy2(_endTime, _midLine)
+    true
+
+// IZ Render
+if renderingEnabled and (barstate.islastconfirmedhistory or (barstate.isconfirmed and barstate.islast))
+    for curIZ in allIZs
+        renderIZ(curIZ)
+//#endregion
+
+// Alerts
+alertcondition(bullishIZDetected, "Bullish Impulse Zones", "A new Bullish Impulse Zone has formed.")
+alertcondition(bearishIZDetected, "Bearish Impulse Zones", "A new Bearish Impulse Zone has formed.")
+
+alertcondition(renderBullishRetest, "Bullish Impulse Zone Retest", "A new Bullish Impulse Zone retest occured.")
+alertcondition(renderBearishRetest, "Bearish Impulse Zone Retest", "A new Bearish Impulse Zone retest occured.")
+
+if bullishIZAlertEnabled and bullishIZDetected
+    alert("A new Bullish Impulse Zone has formed.")
+if bearishIZAlertEnabled and bearishIZDetected
+    alert("A new Bearish Impulse Zone has formed.")
+
+if renderBullishRetest and bullishIZRetestAlertEnabled
+    alert("A new Bullish Impulse Zone retest occured.")
+if renderBearishRetest and bearishIZRetestAlertEnabled
+    alert("A new Bearish Impulse Zone retest occured.")
